@@ -4,222 +4,197 @@ import glob
 import cv2
 import os
 
-class PanaromaStitcher:
+class PanoramaStitcher:
     def __init__(self):
-        # Configuration parameters
-        self.resize_percentage = 30
-        self.ransac_iterations = 100  # Increased from 50
-        self.ransac_threshold = 4.0    # Refined threshold
-        self.match_ratio = 0.7         # Slightly more strict matching
-        self.min_matches = 10          # Minimum matches required
-        self.blend_width = 50          # For feathering blend
+        self.focal_length = 1000  # Default focal length for cylindrical projection
 
-    def make_panaroma_for_images_in(self, path):
-        image_files = sorted(glob.glob(path + os.sep + '*'))
-        print(f"Found {len(image_files)} images for panorama creation.")
-
-        if len(image_files) < 2:
-            raise ValueError("Stitching requires at least two images.")
-
-        # Read and preprocess first image
-        pano_result = cv2.imread(image_files[0])
-        if pano_result is None:
-            raise ValueError(f"Unable to load first image: {image_files[0]}")
-            
-        # Apply color correction
-        pano_result = self.adjust_gamma(pano_result, 1.2)
-        pano_result = cv2.resize(pano_result, None, 
-                               fx=self.resize_percentage / 100, 
-                               fy=self.resize_percentage / 100)
-
-        homography_matrices = []
-        for current_image in image_files[1:]:
-            next_image = cv2.imread(current_image)
-            if next_image is None:
-                print(f"Warning: Unable to load image at {current_image}, skipping.")
-                continue
-            
-            # Apply same preprocessing to next image
-            next_image = self.adjust_gamma(next_image, 1.2)
-            next_image = cv2.resize(next_image, None, 
-                                  fx=self.resize_percentage / 100, 
-                                  fy=self.resize_percentage / 100)
-            
-            try:
-                pano_result, homography_matrix = self.Stitch_2_image_and_matrix_return(pano_result, next_image)
-                homography_matrices.append(homography_matrix)
-            except Exception as e:
-                print(f"Warning: Stitching failed for image {current_image}: {str(e)}")
-                continue
-
-        # Final color balance and contrast adjustment
-        pano_result = self.enhance_final_image(pano_result)
+    def cylindrical_warp(self, img):
+        h, w = img.shape[:2]
+        K = np.array([[self.focal_length, 0, w/2], 
+                     [0, self.focal_length, h/2],
+                     [0, 0, 1]], dtype=np.float32)
         
-        cv2.imwrite('stitched_panorama_result.jpg', pano_result)
-        print("Panorama image saved as 'stitched_panorama_result.jpg'.")
-
-        return pano_result, homography_matrices
-
-    def adjust_gamma(self, image, gamma=1.0):
-        """Apply gamma correction for better exposure."""
-        inv_gamma = 1.0 / gamma
-        table = np.array([((i / 255.0) ** inv_gamma) * 255
-                         for i in np.arange(0, 256)]).astype("uint8")
-        return cv2.LUT(image, table)
-
-    def enhance_final_image(self, image):
-        """Enhance the final panorama with better contrast and color."""
-        # Convert to LAB color space for better color manipulation
-        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-        l, a, b = cv2.split(lab)
+        # Create meshgrid of coordinates
+        y_i, x_i = np.indices((h, w))
+        X = np.stack([x_i, y_i, np.ones_like(x_i)], axis=-1).reshape(h*w, 3)
         
-        # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
-        l = clahe.apply(l)
+        # Convert to cylindrical coordinates
+        X = X.T
+        x_normalized = X[0] - K[0,2]
+        y_normalized = X[1] - K[1,2]
+        theta = x_normalized / K[0,0]
+        h_i = K[1,1] * np.tan(y_normalized / np.sqrt(K[0,0]**2 + x_normalized**2))
+        x_proj = K[0,2] + K[0,0] * theta
+        y_proj = K[1,2] + h_i
         
-        # Merge channels and convert back to BGR
-        lab = cv2.merge((l,a,b))
-        enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+        # Reshape back to image
+        x_proj = x_proj.reshape(h, w).astype(np.float32)
+        y_proj = y_proj.reshape(h, w).astype(np.float32)
         
-        # Increase saturation slightly
-        hsv = cv2.cvtColor(enhanced, cv2.COLOR_BGR2HSV)
-        h, s, v = cv2.split(hsv)
-        s = cv2.multiply(s, 1.2)  # Increase saturation by 20%
-        hsv = cv2.merge([h, s, v])
-        enhanced = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+        # Remap image
+        warped = cv2.remap(img, x_proj, y_proj, cv2.INTER_LINEAR)
         
-        return enhanced
-
-    def obtain_the_key_points(self, left_image, right_image):
-        # Convert to grayscale
-        grayscale_left = cv2.cvtColor(left_image, cv2.COLOR_BGR2GRAY)
-        grayscale_right = cv2.cvtColor(right_image, cv2.COLOR_BGR2GRAY)
-
-        # Apply contrast enhancement before feature detection
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
-        grayscale_left = clahe.apply(grayscale_left)
-        grayscale_right = clahe.apply(grayscale_right)
-
-        # Use SIFT with adjusted parameters for better feature detection
-        sift_detector = cv2.SIFT_create(
-           
-            nOctaveLayers=3,  # increased from default 3
-            contrastThreshold=0.04,  # decreased from default 0.04
-            edgeThreshold=10,  # default is 10
-            sigma=1.6  # default is 1.6
-        )
-
-        kp1, desc1 = sift_detector.detectAndCompute(grayscale_left, None)
-        kp2, desc2 = sift_detector.detectAndCompute(grayscale_right, None)
-
-        return kp1, desc1, kp2, desc2
-
-    def align_and_match_feature_points(self, kp1, kp2, desc1, desc2):
-        # Use better FLANN parameters
-        FLANN_INDEX_KDTREE = 1
-        index_params = dict(algorithm=FLANN_INDEX_KDTREE, trees=5)
-        search_params = dict(checks=50)
-        flann = cv2.FlannBasedMatcher(index_params, search_params)
-
-        matches = flann.knnMatch(desc1, desc2, k=2)
-        filtered_matches = []
-
-        # Apply ratio test with configurable ratio
-        for m, n in matches:
-            if m.distance < self.match_ratio * n.distance:
-                left_coords = kp1[m.queryIdx].pt
-                right_coords = kp2[m.trainIdx].pt
-                filtered_matches.append([left_coords[0], left_coords[1], 
-                                      right_coords[0], right_coords[1]])
-
-        if len(filtered_matches) < self.min_matches:
-            raise ValueError(f"Not enough matches found: {len(filtered_matches)}")
-
-        return filtered_matches
-
-    def implementated_Ransac(self, matched_points):
-        if len(matched_points) < 4:
-            raise ValueError("Not enough matches for RANSAC")
-
-        max_inliers = []
-        best_homography = None
-        
-        # Normalize points for better numerical stability
-        pts_src = np.float32([[pt[0], pt[1]] for pt in matched_points])
-        pts_dst = np.float32([[pt[2], pt[3]] for pt in matched_points])
-        
-        # Find homography using OpenCV's built-in RANSAC
-        H, mask = cv2.findHomography(pts_src, pts_dst, cv2.RANSAC, 
-                                   ransacReprojThreshold=self.ransac_threshold,
-                                   maxIters=self.ransac_iterations)
-        
-        if H is None:
-            raise ValueError("Could not find valid homography")
-            
-        return H
-
-    def apply_warp(self, source_img, homography_matrix, output_width, output_height):
-        # Use OpenCV's warp perspective with border reflection
-        warped = cv2.warpPerspective(
-            source_img, 
-            homography_matrix,
-            (output_width, output_height),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_REFLECT
-        )
+        # Mask out invalid regions
+        mask = (x_proj >= 0) & (x_proj < w) & (y_proj >= 0) & (y_proj < h)
+        mask = mask.astype(np.uint8)
+        warped = warped * mask[:,:,np.newaxis]
         
         return warped
 
-    def Stitch_2_image_and_matrix_return(self, left_image, right_image):
-        # Get keypoints and descriptors
+    def make_panorama_for_images_in(self, path, reference_index=None):
+        image_files = sorted(glob.glob(path + os.sep + '*'))
+        print(f"Found {len(image_files)} images for panorama creation.")
+        
+        if len(image_files) < 2:
+            raise ValueError("Stitching requires at least two images.")
+            
+        if reference_index is None:
+            reference_index = len(image_files) // 2
+            
+        # Read and warp all images
+        images = []
+        for img_path in image_files:
+            img = cv2.imread(img_path)
+            if img is None:
+                print(f"Warning: Unable to load image at {img_path}, skipping.")
+                continue
+            img = cv2.resize(img, None, fx=0.5, fy=0.5)
+            warped_img = self.cylindrical_warp(img)
+            images.append(warped_img)
+            
+        # Start from reference image
+        result = images[reference_index]
+        homography_matrices = []
+        
+        # Stitch images to the right
+        for i in range(reference_index + 1, len(images)):
+            result, H = self.stitch_images(result, images[i], direction='right')
+            homography_matrices.append(H)
+            
+        # Stitch images to the left
+        left_result = images[reference_index]
+        for i in range(reference_index - 1, -1, -1):
+            left_result, H = self.stitch_images(images[i], left_result, direction='left')
+            homography_matrices.append(H)
+            
+        # Combine left and right parts if necessary
+        if reference_index > 0:
+            result, H = self.stitch_images(left_result, result, direction='right')
+            homography_matrices.append(H)
+            
+        cv2.imwrite('stitched_panorama_result.jpg', result)
+        print("Panorama image saved as 'stitched_panorama_result.jpg'.")
+        
+        return result, homography_matrices
+
+    def stitch_images(self, left_image, right_image, direction='right'):
         kp1, desc1, kp2, desc2 = self.obtain_the_key_points(left_image, right_image)
-        
-        # Match features
         keypoint_matches = self.align_and_match_feature_points(kp1, kp2, desc1, desc2)
-        
-        # Find homography
         optimal_H = self.implementated_Ransac(keypoint_matches)
         
-        # Calculate output dimensions
-        h1, w1 = right_image.shape[:2]
-        h2, w2 = left_image.shape[:2]
+        img_height1, img_width1 = right_image.shape[:2]
+        img_height2, img_width2 = left_image.shape[:2]
         
-        # Calculate corners of warped image
-        corners = np.float32([[0, 0], [0, h2], [w2, h2], [w2, 0]]).reshape(-1, 1, 2)
-        warped_corners = cv2.perspectiveTransform(corners, optimal_H)
-        all_corners = np.concatenate((
-            np.float32([[0, 0], [0, h1], [w1, h1], [w1, 0]]).reshape(-1, 1, 2),
-            warped_corners
-        ))
+        corners_image1 = np.float32([[0, 0], [0, img_height1], [img_width1, img_height1], [img_width1, 0]]).reshape(-1, 1, 2)
+        corners_image2 = np.float32([[0, 0], [0, img_height2], [img_width2, img_height2], [img_width2, 0]]).reshape(-1, 1, 2)
         
-        # Calculate dimensions of output image
-        [x_min, y_min] = np.int32(all_corners.min(axis=0).ravel() - 0.5)
-        [x_max, y_max] = np.int32(all_corners.max(axis=0).ravel() + 0.5)
+        transformed_corners = cv2.perspectiveTransform(corners_image2, optimal_H)
+        combined_corners = np.concatenate((corners_image1, transformed_corners), axis=0)
         
-        # Adjust transformation matrix
-        translation = np.array([
-            [1, 0, -x_min],
-            [0, 1, -y_min],
-            [0, 0, 1]
-        ])
-        optimal_H = translation.dot(optimal_H)
+        [x_min, y_min] = np.int32(combined_corners.min(axis=0).ravel() - 0.5)
+        [x_max, y_max] = np.int32(combined_corners.max(axis=0).ravel() + 0.5)
         
-        # Create output image
-        output = self.apply_warp(left_image, optimal_H, x_max - x_min, y_max - y_min)
+        translation_matrix = np.array([[1, 0, -x_min], [0, 1, -y_min], [0, 0, 1]]).dot(optimal_H)
         
-        # Create a mask for blending
-        mask = np.zeros((y_max - y_min, x_max - x_min), dtype=np.float32)
-        mask[(-y_min):h1 + (-y_min), (-x_min):w1 + (-x_min)] = 1
+        warped = self.apply_warp(left_image, translation_matrix, x_max - x_min, y_max - y_min)
         
-        # Apply feathering blend
-        mask = cv2.GaussianBlur(mask, (self.blend_width * 2 + 1, self.blend_width * 2 + 1), 0)
+        # Create masks for blending
+        mask1 = np.zeros((y_max - y_min, x_max - x_min), dtype=np.float32)
+        mask1[(-y_min):img_height1 + (-y_min), (-x_min):img_width1 + (-x_min)] = 1
         
-        # Blend images
-        warped_img = output.astype(np.float32)
-        img2_warped = np.zeros_like(warped_img)
-        img2_warped[(-y_min):h1 + (-y_min), (-x_min):w1 + (-x_min)] = right_image
+        mask2 = np.ones_like(warped[:,:,0], dtype=np.float32)
         
-        # Blend using the mask
-        blended = img2_warped * mask[:, :, np.newaxis] + warped_img * (1 - mask[:, :, np.newaxis])
+        # Apply Gaussian blur to masks for smooth blending
+        blur_size = 51  # Must be odd
+        mask1 = cv2.GaussianBlur(mask1, (blur_size, blur_size), 0)
+        mask2 = cv2.GaussianBlur(mask2, (blur_size, blur_size), 0)
         
-        return blended.astype(np.uint8), optimal_H
+        # Normalize masks
+        mask1 = mask1 / (mask1 + mask2 + 1e-10)
+        mask2 = mask2 / (mask1 + mask2 + 1e-10)
+        
+        # Apply masks and blend
+        warped_with_mask = warped * mask2[:,:,np.newaxis]
+        right_with_mask = np.zeros_like(warped)
+        right_with_mask[(-y_min):img_height1 + (-y_min), (-x_min):img_width1 + (-x_min)] = \
+            right_image * mask1[(-y_min):img_height1 + (-y_min), (-x_min):img_width1 + (-x_min), np.newaxis]
+        
+        blended = warped_with_mask + right_with_mask
+        
+        return blended, optimal_H
+
+    def obtain_the_key_points(self, left_image, right_image):
+        grayscale_left = cv2.cvtColor(left_image, cv2.COLOR_BGR2GRAY)
+        grayscale_right = cv2.cvtColor(right_image, cv2.COLOR_BGR2GRAY)
+        
+        sift_detector = cv2.SIFT_create()
+        kp1, desc1 = sift_detector.detectAndCompute(grayscale_left, None)
+        kp2, desc2 = sift_detector.detectAndCompute(grayscale_right, None)
+        
+        return kp1, desc1, kp2, desc2
+
+    def align_and_match_feature_points(self, kp1, kp2, desc1, desc2):
+        flann_index_params = dict(algorithm=1, trees=5)
+        flann_search_params = dict(checks=50)
+        flann_matcher = cv2.FlannBasedMatcher(flann_index_params, flann_search_params)
+        
+        knn_matches = flann_matcher.knnMatch(desc1, desc2, k=2)
+        filtered_matches = []
+        
+        for match_1, match_2 in knn_matches:
+            if match_1.distance < 0.75 * match_2.distance:
+                left_coords = kp1[match_1.queryIdx].pt
+                right_coords = kp2[match_1.trainIdx].pt
+                filtered_matches.append([left_coords[0], left_coords[1], right_coords[0], right_coords[1]])
+        
+        return filtered_matches
+
+    def calculate_homography(self, matched_points):
+        equation_matrix = []
+        for match in matched_points:
+            x, y = match[0], match[1]
+            X, Y = match[2], match[3]
+            equation_matrix.append([x, y, 1, 0, 0, 0, -X * x, -X * y, -X])
+            equation_matrix.append([0, 0, 0, x, y, 1, -Y * x, -Y * y, -Y])
+        
+        equation_matrix = np.array(equation_matrix)
+        _, _, v_transpose = np.linalg.svd(equation_matrix)
+        homography_matrix = (v_transpose[-1, :].reshape(3, 3))
+        homography_matrix = homography_matrix / homography_matrix[2, 2]
+        return homography_matrix
+
+    def implementated_Ransac(self, matched_points):
+        max_inliers = []
+        best_homography = []
+        threshold_dist = 5
+        num_iterations = 50
+        
+        for _ in range(num_iterations):
+            sample_points = random.sample(matched_points, k=4)
+            H = self.calculate_homography(sample_points)
+            current_inliers = []
+            
+            for pt in matched_points:
+                origin_pt = np.array([pt[0], pt[1], 1]).reshape(3, 1)
+                target_pt = np.array([pt[2], pt[3], 1]).reshape(3, 1)
+                transformed_pt = np.dot(H, origin_pt)
+                transformed_pt /= transformed_pt[2]
+                point_distance = np.linalg.norm(target_pt - transformed_pt)
+                
+                if point_distance < threshold_dist:
+                    current_inliers.append(pt)
+            
+            if len(current_inliers) > len(max_inliers):
+                max_inliers, best_homography = current_inliers, H
+        
+        return best_homography
