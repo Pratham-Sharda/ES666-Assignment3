@@ -7,8 +7,8 @@ import os
 class PanaromaStitcher:
     def __init__(self):
         # Configuration parameters
-        self.resize_percentage = 50
-        self.ransac_iterations = 1000  # Increased from 50
+        self.resize_percentage = 30
+        self.ransac_iterations = 100  # Increased from 50
         self.ransac_threshold = 4.0    # Refined threshold
         self.match_ratio = 0.7         # Slightly more strict matching
         self.min_matches = 10          # Minimum matches required
@@ -102,8 +102,8 @@ class PanaromaStitcher:
 
         # Use SIFT with adjusted parameters for better feature detection
         sift_detector = cv2.SIFT_create(
-            nfeatures=0,  # no limit
-            nOctaveLayers=5,  # increased from default 3
+           
+            nOctaveLayers=3,  # increased from default 3
             contrastThreshold=0.04,  # decreased from default 0.04
             edgeThreshold=10,  # default is 10
             sigma=1.6  # default is 1.6
